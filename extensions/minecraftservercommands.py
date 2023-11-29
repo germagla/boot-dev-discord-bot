@@ -17,7 +17,16 @@ def in_channel(channel_id):
     return commands.check(predicate)
 
 
-def handle_wrong_channel_error(ctx, error):
+def get_ec2_instance_status(instance_id):
+    client = boto3.client(
+        'ec2',
+        aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+        aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
+        region_name=os.getenv('AWS_REGION'))
+    return client.describe_instances(InstanceIds=[instance_id])['Reservations'][0]['Instances'][0]['State']['Name']
+
+
+def handle_error(ctx, error):
     if isinstance(error, discord.errors.CheckFailure):
         return ctx.respond(
             embed=discord.Embed(
@@ -40,6 +49,7 @@ class MinecraftServerCommands(commands.Cog):
         self.bot = bot
         self.instance_ID = os.getenv('MINECRAFT_EC2_INSTANCE_ID')
         self.server_ip = os.getenv('MINECRAFT_EC2_INSTANCE_IP')
+        self.server_port = 8008
         self.ec2_client = boto3.client(
             'ec2',
             aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
@@ -53,12 +63,12 @@ class MinecraftServerCommands(commands.Cog):
         response = self.ec2_client.start_instances(InstanceIds=[self.instance_ID])
         embed = discord.Embed(title="Server Status")
         if response['StartingInstances'][0]['CurrentState']['Name'] == 'pending':
-            embed.description = 'Server is starting.'
+            embed.description = 'Server is starting...'
             message = await ctx.respond(embed=embed)
-            state = self.ec2_client.describe_instances(InstanceIds=[self.instance_ID])['Reservations'][0]['Instances'][0]['State']['Name']
+            state = get_ec2_instance_status(self.instance_ID)
             while state == 'pending':
                 await asyncio.sleep(5)
-                state = self.ec2_client.describe_instances(InstanceIds=[self.instance_ID])['Reservations'][0]['Instances'][0]['State']['Name']
+                state = get_ec2_instance_status(self.instance_ID)
             if state == 'running':
                 embed.description = 'Server started.'
                 embed.color = discord.Color.green()
@@ -67,32 +77,56 @@ class MinecraftServerCommands(commands.Cog):
                 embed.color = discord.Color.red()
             await message.edit_original_response(embed=embed)
         elif response['StartingInstances'][0]['CurrentState']['Name'] == 'running':
-            await ctx.respond('Server is already running.')
+            embed.description = 'Server is already running.'
+            embed.color = discord.Color.green()
+            await ctx.respond(embed=embed)
         else:
-            await ctx.respond('Failed to start Server.')
+            embed.description = 'Failed to start Server.'
+            embed.color = discord.Color.red()
+            await ctx.respond(embed=embed)
 
     @commands.slash_command(name="stop_minecraft_server",
                             description="Stops the Minecraft server")
     @in_channel(server_management_channel_id)
     async def stop_minecraft_server(self, ctx):
         response = self.ec2_client.stop_instances(InstanceIds=[self.instance_ID])
+        embed = discord.Embed(title="Server Status")
         if response['StoppingInstances'][0]['CurrentState']['Name'] == 'stopping':
-            await ctx.respond('Server Stopping...')
+            embed.description = 'Server is shutting down...'
+            message = await ctx.respond(embed=embed)
+            state = get_ec2_instance_status(self.instance_ID)
+            while state == 'stopping':
+                await asyncio.sleep(5)
+                state = get_ec2_instance_status(self.instance_ID)
+            if state == 'stopped':
+                embed.description = 'Server off.'
+                embed.color = discord.Color.darker_gray()
+            else:
+                embed.description = 'Server failed to stop.'
+                embed.color = discord.Color.red()
+            await message.edit_original_response(embed=embed)
+
         elif response['StoppingInstances'][0]['CurrentState']['Name'] == 'stopped':
-            await ctx.respond('Server is already stopped.')
+            embed.description = 'Server is already off.'
+            embed.color = discord.Color.darker_gray()
+            await ctx.respond(embed=embed)
+
         else:
-            await ctx.respond('Failed to stop Server.')
+            embed.description = 'Failed to stop Server.'
+            embed.color = discord.Color.red()
+            await ctx.respond(embed=embed)
 
     @commands.slash_command(name="server_status",
                             description="Checks the status of the Minecraft server")
+    @in_channel(server_management_channel_id)
     async def minecraft_server_status(self, ctx):
         embed = discord.Embed(title="Server Status")
-        response = self.ec2_client.describe_instances(InstanceIds=[self.instance_ID])
-        if response['Reservations'][0]['Instances'][0]['State']['Name'] == 'running':
+        status = get_ec2_instance_status(self.instance_ID)
+        if status == 'running':
             embed.description = 'Server is running.\n'
 
             try:
-                server = await JavaServer.async_lookup(f"{self.server_ip}:8008")
+                server = await JavaServer.async_lookup(f"{self.server_ip}:{self.server_port}")
                 embed.color = discord.Color.green()
                 if server.status().players.online == 0:
                     embed.description += "There are no players online."
@@ -108,28 +142,27 @@ class MinecraftServerCommands(commands.Cog):
                 embed.description += f'Failed to fetch player list with error:\n{e}'
                 embed.color = discord.Color.yellow()
                 await ctx.respond(embed=embed)
-                # await ctx.respond(f'Server is running. Failed to fetch player list with error:\n{e}')
-        elif response['Reservations'][0]['Instances'][0]['State']['Name'] == 'stopped':
+        elif status == 'stopped':
             embed.description = 'Server is off.'
             embed.color = discord.Color.darker_gray()
             await ctx.respond(embed=embed)
-        elif response['Reservations'][0]['Instances'][0]['State']['Name'] == 'stopping':
+        elif status == 'stopping':
             embed.description = 'Server is shutting down...'
             embed.color = discord.Color.dark_gray()
             await ctx.respond(embed=embed)
-        elif response['Reservations'][0]['Instances'][0]['State']['Name'] == 'pending':
+        elif status == 'pending':
             embed.description = 'Server is starting...'
             embed.color = discord.Color.blue()
             await ctx.respond(embed=embed)
         else:
-            embed.description = 'Server is in an unknown state.'
+            embed.description = 'Server is in an unknown state.\nServer state: ' + status
             embed.color = discord.Color.red()
             await ctx.respond(embed=embed)
 
-    @commands.slash_command(name="get_server_ip",
-                            description="Gets the IP address of the Minecraft server")
-    async def get_server_ip(self, ctx):
-        await ctx.respond(f'The Minecraft server IP address is {self.server_ip}', ephemeral=True)
+        @commands.slash_command(name="get_server_info",
+                                description="Gets the IP address and port of the Minecraft server")
+        async def get_server_info(self, ctx):
+            await ctx.respond(f'The Minecraft server IP address is {self.server_ip}', ephemeral=True)
 
     @commands.slash_command(name="ping_minecraft_server", description="Pings the Minecraft server")
     async def ping_minecraft_server(self, ctx):
@@ -137,12 +170,17 @@ class MinecraftServerCommands(commands.Cog):
 
     @start_minecraft_server.error
     async def start_minecraft_server_error(self, ctx, error):
-        await handle_wrong_channel_error(ctx, error)
+        await handle_error(ctx, error)
         return
 
     @stop_minecraft_server.error
     async def stop_minecraft_server_error(self, ctx, error):
-        await handle_wrong_channel_error(ctx, error)
+        await handle_error(ctx, error)
+        return
+
+    @minecraft_server_status.error
+    async def minecraft_server_status_error(self, ctx, error):
+        await handle_error(ctx, error)
         return
 
 
