@@ -1,7 +1,7 @@
 import asyncio
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 import os
 import boto3
 from mcstatus import JavaServer
@@ -50,11 +50,15 @@ class MinecraftServerCommands(commands.Cog):
         self.instance_ID = os.getenv('MINECRAFT_EC2_INSTANCE_ID')
         self.server_ip = os.getenv('MINECRAFT_EC2_INSTANCE_IP')
         self.server_port = 8008
+        self.server_watchdog.start()
         self.ec2_client = boto3.client(
             'ec2',
             aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
             aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
             region_name=os.getenv('AWS_REGION'))
+
+    def cog_unload(self):
+        self.server_watchdog.cancel()
 
     @commands.slash_command(name="start_minecraft_server",
                             description="Starts the Minecraft server")
@@ -182,6 +186,48 @@ class MinecraftServerCommands(commands.Cog):
     async def minecraft_server_status_error(self, ctx, error):
         await handle_error(ctx, error)
         return
+
+    @tasks.loop(minutes=60)
+    async def server_watchdog(self):
+        await self.bot.wait_until_ready()
+        status = get_ec2_instance_status(self.instance_ID)
+        if status == 'running':
+            try:
+                server = await JavaServer.async_lookup(f"{self.server_ip}:{self.server_port}")
+                if server.status().players.online == 0:
+                    channel = self.bot.get_channel(server_management_channel_id)
+                    message = await channel.send(embed=discord.Embed(
+                        title="Server Notification",
+                        description="There are no players online. Shutting down server in 30 seconds unless a player connects.",
+                        color=discord.Color.yellow()))
+                    await asyncio.sleep(30)
+                    server = await JavaServer.async_lookup(f"{self.server_ip}:{self.server_port}")
+                    if server.status().players.online == 0:
+                        # stop the server
+                        response = self.ec2_client.stop_instances(InstanceIds=[self.instance_ID])
+                        embed = discord.Embed(title="Server Status")
+                        if response['StoppingInstances'][0]['CurrentState']['Name'] == 'stopping':
+                            embed.description = 'Server is shutting down...'
+                            message = await message.edit(embed=embed)
+                            state = get_ec2_instance_status(self.instance_ID)
+                            while state == 'stopping':
+                                await asyncio.sleep(5)
+                                state = get_ec2_instance_status(self.instance_ID)
+                            if state == 'stopped':
+                                embed.description = 'Server off.'
+                                embed.color = discord.Color.darker_gray()
+                            else:
+                                embed.description = 'Server failed to stop.'
+                                embed.color = discord.Color.red()
+                            await message.edit(embed=embed)
+                    else:
+                        pass
+                else:
+                    pass
+            except Exception as e:
+                print(e)
+        elif status == 'stopped':
+            pass
 
 
 def setup(bot):
