@@ -208,6 +208,7 @@ class MinecraftServerCommands(commands.Cog):
                         embed = discord.Embed(title="Server Status")
                         if response['StoppingInstances'][0]['CurrentState']['Name'] == 'stopping':
                             embed.description = 'Server is shutting down...'
+                            embed.color = discord.Color.light_gray()
                             message = await message.edit(embed=embed)
                             state = get_ec2_instance_status(self.instance_ID)
                             while state == 'stopping':
